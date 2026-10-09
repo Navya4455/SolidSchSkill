@@ -39,7 +39,8 @@ SOLIDWORKS Electrical, where both the user and Claude keep editing it.
 | SOLIDWORKS Electrical | **2026 SP4.1, 34.41.1011** — `C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS Electrical` |
 | SOLIDWORKS | 2026 SP4.1, 34.141.1011 (must stay on the same version as Electrical) |
 | API | COM, `ewapix.dll` 2026.4.1.1011; interop `bin\Interop.x64.EwAPI.dll` (718 types; SP0 had 693). Use the **version-independent ProgID** `EwAPI.EwInteropFactoryX` (both `…2026.0` and `…2026.4` are registered). |
-| Database | SQL Server 2022 Express RTM 16.0.1000.6, instance `.\TEW_SQLEXPRESS`, Windows auth. App DBs `tew_app_data`, `tew_app_macro`, `tew_app_project`, `tew_catalog`, `tew_classification`; one `tew_project_data_<id>` per project. Data tables in schema `tew`, `tew_version` in `dbo`. **Project-data schema 292, app-project schema 32.** |
+| API licence | **The API needs a licence code from the reseller.** The official 2026 add-in sample calls `getEwApplication("License Code(*)")` with the note *"License Code(*): Contact your reseller to get your license code."* `EwErrorCode` has `EW_INVALID_LICENSE` (39) and `EW_LICENSE_WITHOUT_API_OPTION` (40), so the Electrical licence must also include the API option. The code is a secret: it lives in `%LOCALAPPDATA%\AddLife\swe-bridge\license.txt`, never in git. |
+| Database | SQL Server 2022 Express RTM 16.0.1000.6, instance `.\TEW_SQLEXPRESS`, Windows auth. App DBs `tew_app_data`, `tew_app_macro`, `tew_app_project`, `tew_catalog`, `tew_classification` keep their tables in schema **`tew`**; each project DB `tew_project_data_<pro_directory>` keeps its tables in schema **`dbo`**; `tew_version` is in `dbo` everywhere. **Project-data schema 292 (`dbo.tew_version.ver_projectdata`), app-project schema 32 (`tew_app_project.dbo.tew_version.ver_projects`).** |
 | Data folder | `C:\ProgramData\SOLIDWORKS Electrical` — `Projects\<id>\Drawings\*.ewg`, `ProjectTemplate\ADDLIFE Template.proj.tewzip`, `TitleBlock`, `XmlConfig\AutomateDrawing` |
 | Library (counted 2026-10-05) | ~22,200 symbols, 4,233 manufacturer parts (3,781 EATON, 23 Beckhoff, **0 Inovance**), 66 title blocks |
 | Licence | Standalone serial-number activation (not SolidNetWork, not 3DEXPERIENCE) |
@@ -83,9 +84,12 @@ The skill is installed for Claude Code as `solidworks-electrical` by a directory
 
 ### 5.1 Loading and connection
 
-- A COM-visible class implementing `EwAPI.IEwAddIn`. In `connectToEwAPI(factory)` it obtains the
-  application through `IEwInteropFactoryX.getEwApplication`. How Electrical registers and loads add-ins,
-  and whether a key is needed, is spike question S1.
+- A COM-visible, x64 class implementing `EwAPI.EwAddIn`. In `connectToEwAPI(factory)` it obtains the
+  application through `IEwInteropFactoryX.getEwApplication(<licence code>)`.
+- Registration follows the documented procedure: `regasm /codebase` (administrator) runs the class's
+  `[ComRegisterFunction]`, which writes `HKLM\SOFTWARE\SolidWorks\SOLIDWORKS Electrical\AddIns\{GUID}`
+  (`Title`, `Description`, `Path`) and `HKCU\SOFTWARE\SolidWorks\SOLIDWORKS Electrical\AddIns\{GUID}`
+  (`StartUp=1`). Electrical loads it at startup. Whether this works with our licence code is spike S1.
 - It starts an HTTP listener bound to **127.0.0.1 only** on a free port, and writes
   `%LOCALAPPDATA%\AddLife\swe-bridge\session.json` = `{port, token, pid, started_at, ewapi_version}`.
   The token is random per start and must be sent as `X-SWE-Token`. `swe` reads the file.
@@ -125,7 +129,7 @@ handed over (§9.1).
 | Group | Operations |
 |---|---|
 | Session | `health`, `open_project`, `current_project`, `create_project_from_template`, `set_project_properties`, `snapshot`, `archive` (`.tewzip`) |
-| Read | `project_tree` (books/folders/sheets with type, title, position), `sheet_contents` (symbols, connection points, lines, texts with ids and coordinates), `components`, `wires`, `locations`, `functions`, `title_block_grid` (columns/rows from `IEwTitleBlockX`), `search_symbols`, `search_parts`, `search_macros`, `title_blocks` |
+| Read | `project_tree` (books/folders/sheets with type, title, position), `sheet_contents` (symbols, connection points, lines, texts with ids and coordinates), `components`, `wires`, `locations`, `functions`, `title_block_grid` (columns/rows from `IEwTitleBlockX`). Library search (symbols, parts, macros, title blocks) is a bulk read and is served by `swe db search-*` over SQL (§6), not by the add-in. |
 | Edit project | `create_book`, `create_sheet` / `move_sheet` / `delete_sheet` (type, title block, description), `create_location`, `create_function`, `upsert_component` (tag, description, location, function, part, user data), `place_symbol`, `draw_wire`, `place_text`, `insert_macro`, `move`, `delete`, `clear_sheet` |
 | Library | `create_symbol` (DXF graphics, connection points, circuits, root mark, class, library), `update_symbol_graphics`, `create_part` (circuits, terminal labels, symbol link, manufacturer data, PLC channels), `create_macro`, `set_review_flag` |
 | Actions | `number_wires`, `generate_terminal_strips`, `update_reports`, `render_sheet_png` (`IEwSaveDWGImageX`), `render_symbol_png`, `export_pdf` |
@@ -141,6 +145,12 @@ handed over (§9.1).
 - Library writes go only to the `ADDLIFE` library. **Standard library items are never modified.**
 - The add-in refuses mutating operations while the target project is open for write by another user
   (`IEwProjectX.isOpenByAnother`).
+- **Mutation allowlist:** mutating operations run only on projects named in
+  `%LOCALAPPDATA%\AddLife\swe-bridge\config.json` → `mutation_allowlist` (Phase 0/1: `SPIKE-*`, `LIBTEST*`).
+  Every other project — including the user's existing ones — is read-only to the bridge until it is
+  added on purpose.
+- Every batch names its target project; the add-in refuses the batch if Electrical's current project is
+  a different one, so a project switched in the UI mid-session cannot receive another project's edits.
 
 ### 5.6 Ops log (D8)
 
@@ -171,7 +181,10 @@ The SQL layer:
 
 ### 7.1 Where things go
 
-- One library, **`ADDLIFE`**, filed under Electrical's standard classification nodes.
+- One library, **`ADDLIFE`**, filed under Electrical's standard classification nodes. *Name pending decision
+  D-F:* an `Addlife` library with 196 human-made symbols already exists (2026-10-09) and the names would
+  collide; the proposal is a separate `ADDLIFE_AUTO` library so Claude's items can be reviewed and rolled
+  back on their own. Wherever this spec says `ADDLIFE` library, read the name D-F settles on.
 - **Reuse first:** before creating anything Claude searches the existing library (`swe db search-symbols`,
   `search-parts`). Generic IEC symbols (contacts, coils, MCBs, motors, fuses, lamps…) are always reused.
 
@@ -359,8 +372,8 @@ the spike can change what follows.
 
 | Phase | Delivers | Done when |
 |---|---|---|
-| **0. Spike** (throwaway code) | Answers to S1–S9 with a chosen fallback where one fails; interop surface dump `docs/reference/ewapi-2026.4.1-types.txt` | Findings written to `docs/superpowers/specs/` as an amendment; this design updated where needed |
-| **1. Bridge** | Add-in, `swe` CLI, read-only SQL layer with schema guard, `swe selftest`, snapshots, renders | Selftest passes on `LIBTEST`; one sheet built from a batch and rendered |
+| **0. Spike** | Answers to S1–S10 with a chosen fallback where one fails; interop surface dump `docs/reference/ewapi-2026.4.1.1011-types.txt`. The add-in **transport skeleton** (registration, session file, listener, UI dispatcher, batch runner, `health`) is built properly here because every probe needs it, and is kept; only the probe operations are throwaway. | Findings written to `docs/superpowers/specs/` as an amendment; this design and the Phase 1 plan updated where needed |
+| **1. Bridge** | Add-in operations, `swe` CLI, read-only SQL layer with schema guard, `swe selftest`, snapshots, renders, **backups (§14)** | Selftest passes on `LIBTEST`; one sheet built from a batch and rendered; a backup restored |
 | **2. Library pipeline** | Symbol builder, symbol style guide, part creation, PLC modules, review flags, macro capture | MD520, EK1100 + one EL1008, and the PSU built and proven in `LIBTEST` |
 | **3. Template v2** | `ADDLIFE Template` v2 (§8) | Manual-edit test passes on a three-sheet test project |
 | **4. Skill + WetBlasting** | `SKILL.md` + references; the full 31-sheet project | §10.4 passes; user signs off |
@@ -369,7 +382,7 @@ the spike can change what follows.
 
 | # | Question | Fallback |
 |---|---|---|
-| S1 | How does Electrical 2026 SP4.1 register and load a .NET add-in? Does `getEwApplication` need a key? | Background mode out of process (`initializeInBackground`) — **loses the live session (D2); the only fallback that forces a redesign** |
+| S1 | Does the documented registration (§5.1) load our add-in in 2026 SP4.1, and does `getEwApplication` succeed with the reseller's licence code? | **None without a valid code** — background mode also goes through `getEwApplication(key)`. Without the code the project is blocked; this is decision D-A in the Phase 0/1 plan. |
 | S2 | Does a placed symbol plus a drawn line create a connected wire (equipotential, wire, terminal)? | Small connection macros via `insertMacroAt`, or `runCommand` |
 | S3 | Can free text and graphics be placed on a sheet (multilingual text, `runCommand`)? | Text-only notes symbols |
 | S4 | Does `insertFromDwg` keep attributes; do API-added connection points work? | Duplicate a standard black-box symbol and swap its graphics |
@@ -378,6 +391,7 @@ the spike can change what follows.
 | S7 | Can title-block attributes cover edited date and sheet count? Can reports be regenerated through the API or on export? | `update_reports` operation run by the skill and on demand |
 | S8 | Do PNG render of an open drawing, snapshots via API, a localhost listener without admin, and execution on the UI thread all work? | Local workaround per item |
 | S9 | Does a SQL netlist query reproduce the API's view of the same project? | API-only reads, accepting the frozen window |
+| S10 | Does a project archived through the API (`IEwProjectManagerX.archive`) unarchive into an identical project (same netlist), and does an environment archive (`IEwArchiveEnvironmentX`) capture libraries and templates? | Manual archive from Electrical's UI on a schedule; backups stay a documented manual step |
 
 ## 12. Risks
 
@@ -398,3 +412,26 @@ the spike can change what follows.
 - Writing to the database.
 - SOLIDWORKS PDM.
 - Fixing WetBlasting's controller-side open items (`.acbind` channels 6/8, `ioPoints.ts`) — reported only.
+
+## 14. Operations: backups, rollout, ownership
+
+**Backups.** With the Electrical project as the only master (D1), its loss is the loss of the work.
+Checked 2026-10-09: none of the 18 `tew_*` databases had ever been backed up and no project archive
+existed on disk. Therefore:
+
+- `swe backup` archives every project modified since its last successful backup through the add-in
+  (`IEwProjectManagerX.archive`, `.proj.tewzip` = database + drawings) to a **destination off this PC**,
+  and `swe backup --full` adds an environment archive (libraries, templates; `IEwArchiveEnvironmentX`).
+- Retention 30 days. `swe backup --status` reports the age of the last good backup; `swe health` warns
+  when it is older than 7 days.
+- A backup counts only once a **restore has been proven**: phase 1 restores a `LIBTEST` archive into a
+  new project and compares netlists (S10).
+- The skill's workflow B ends with `swe backup` (phase 4).
+- The destination is decision D-C; until it is set, `swe backup` refuses with that message.
+
+**Rollout.** The first version runs on this workstation only. Electrical libraries and templates live
+in each machine's own SQL Server, so colleagues on other PCs need the `ADDLIFE` library and template
+(environment archive), the add-in (installer) and the skill. Proposed as **phase 5**, decision D-D.
+
+**Ownership.** Someone approves new library items (clears `ADL_REVIEW`) and signs off the WetBlasting
+acceptance. Proposed: the requesting engineer; decision D-E.
